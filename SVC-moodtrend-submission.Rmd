@@ -1,0 +1,506 @@
+---
+title: "SVC-moodtrend-submission"
+author: "Jessie Tian"
+date: "2026-11-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Import libraries
+```{r libraries}
+library(readr)
+library(rms)
+library(lattice)
+library(dplyr)
+library(tidyr)
+library(survival)
+library(ggplot2)
+library(skimr)
+library(naniar)
+library(survival)
+library(survminer)
+library(lubridate)
+library(mice)
+library(gtsummary)
+library(dplyr)
+
+require("knitr")
+```
+
+# Load Data
+```{r load data, echo=FALSE}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+stopvape_raw <- read_csv("stopvape_with_mood_class.csv", col_names = TRUE)
+
+stopvape <- stopvape_raw %>%
+  filter(!is.na(mood_class))
+
+cat("Challenges:", nrow(stopvape))
+cat(" Participants:", n_distinct(stopvape$userid))
+
+stopvape.dd <- datadist(stopvape)
+options(datadist = "stopvape.dd")
+```
+
+# Data Exploration
+# mood_class: LCGA-derived mood trajectory class per challenge.
+# 1 = "Poor and Improving"
+# 2 = "Fair and Depressing"
+# 3 = "Good and Improving"
+# Reference = Class 2 ("Fair and Depressing")
+```{r data exploration, echo=FALSE}
+# completeness check
+stopvape_complete <- na.omit(stopvape)
+sum(is.na(stopvape_complete))
+
+# Proportion with at least one missing value = 75.43478
+nrow(stopvape[!complete.cases(stopvape), ])/nrow(stopvape)*100
+
+summary(stopvape)
+colSums(is.na(stopvape))
+```
+
+# Descriptive data based on mood class
+```{r descriptive by mood}
+stopvape %>%
+  distinct(userid, .keep_all = TRUE) %>%
+  tbl_summary(
+    by = mood_class,
+    statistic = list(
+      all_continuous()  ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    )
+  ) %>%
+  add_p() %>%
+  add_overall()
+```
+
+# Prepare data
+```{r}
+# Factor labels for gender and sexual orientation (unchanged)
+stopvape$gender_adj <- factor(stopvape$gender,
+                              levels = c(0, 1, 2),
+                              labels = c("Men", "Women", "Others"))
+stopvape$sexorient_adj <- factor(stopvape$sexorient,
+                                 levels = c(0, 1, 2),
+                                 labels = c("Heterosexual", "LGBTQ",
+                                            "Asexual/Undisclosed"))
+
+# Clean implausible age values
+stopvape <- stopvape %>%
+  mutate(age = ifelse(nchar(as.character(age)) > 3, NA, age))
+
+summary(stopvape$age)
+
+#encode mood_class with class 2(Fair_Depressing) as reference 
+
+stopvape$mood_class <- factor (as.character(stopvape$mood_class), 
+                                 levels = c("2", "1", "3"), 
+                                 labels = c("Fair_Depressing", "Poor_Improving", "Good_Improving"))
+
+```
+
+# Missing data and multiple imputations 
+```{r mice}
+skim(stopvape)
+summary(stopvape, na.rm = TRUE)
+
+#explore patterns of missingness
+na.pat <- naclus(stopvape[,-1])
+naplot(na.pat)
+
+vis_miss(stopvape)
+gg_miss_var(stopvape)
+gg_miss_var(stopvape, show_pct = TRUE)
+gg_miss_case(stopvape)
+
+n_var_miss(stopvape)
+ggplot(data = stopvape,
+       mapping = aes(x = Time.elapsed, y = mood_class)) +
+  geom_miss_point()
+
+# variable vector for MICE (selected variables)
+
+v <- c("userid",
+       "age",
+       "gender_adj",
+       "sexorient_adj",
+       "race",
+       "ecu11b_1",
+       "ecu16_1",
+       "ecu8_1",
+       "cur_csmk_1",
+       "cur_can_1",
+       "cur_alc_1",
+       "cur_otob_1",
+       "status",
+       "Time.elapsed",
+       "mood_class"
+       )
+
+stopvape$userid <- as.factor(stopvape$userid)
+
+set.seed(3098)
+stopvape.mice <- mice(stopvape[, v], m = 5, method = "cart")
+
+# Prevent userid from being imputed
+stopvape.mice$method["userid"] <- ""
+
+stopvape.mice$method
+plot(stopvape.mice)
+
+densityplot(stopvape.mice)
+densityplot(stopvape.mice, ~ mood_class |.imp)
+```
+# CPH on pooled imputed data
+```{r CPH}
+# unadjusted model
+fit1 <- with(stopvape.mice,
+             coxph(
+               Surv(Time.elapsed, status) ~ factor(mood_class) + cluster(userid))
+             )
+pooled_fit1 <- pool(fit1)
+
+# model with mood+covariates
+fit2 <- with(
+  stopvape.mice,
+  coxph(
+    Surv(Time.elapsed, status) ~
+      factor(mood_class) +
+      ecu11b_1 +    # Time to first vape after waking up (0= 0-5 mins, 1=6-30 mins, 2= >30 mins)
+      ecu16_1 +     # Self-perceived addiction to e-cigarette (0= Less addicted, 1= Very addicted)
+      ecu8_1 +      # Frequency of current vaping in past month
+      cur_csmk_1 +  # Smoking cigarette in past 30 days (y/n)
+      cur_can_1 +   # Used cannabis in past 30 days(y/n)
+      cur_alc_1 +   # Drink alcohol in past 30 days (y/n)
+      cur_otob_1 +  # Used other tobacco products in past 30 days (y/n)
+      cluster(userid)
+  )
+)
+
+pooled_fit2 <- pool(fit2)
+
+summary(
+  pooled_fit2,
+  conf.int   = TRUE,
+  exponentiate = TRUE
+)
+
+# adjusted for substance use and substance use and demographics
+fit3 <- with(stopvape.mice,
+             coxph(Surv(Time.elapsed, status) ~ 
+                     factor(mood_class) + 
+                     age + 
+                     gender_adj +
+                     sexorient_adj +
+                     race +
+                     ecu11b_1 +
+                     ecu16_1 +
+                     ecu8_1 +
+                     cur_csmk_1 +
+                     cur_can_1 +
+                     cur_alc_1 +
+                     cur_otob_1 +
+                     cluster(userid)
+                   )
+             )
+
+pooled_fit3 <- pool(fit3)
+
+summary(
+  pooled_fit3,
+  conf.int   = TRUE,
+  exponentiate = TRUE
+)
+
+# mood+demographic only model 
+fitdemo <- with(
+  stopvape.mice,
+  coxph(
+    Surv(Time.elapsed, status) ~
+      factor(mood_class) +
+      age +
+      gender_adj +
+      sexorient_adj +
+      race +
+      cluster(userid)
+  )
+)
+
+pooled_fitdemo <- pool(fitdemo)
+
+summary(
+  pooled_fitdemo,
+  conf.int   = TRUE,
+  exponentiate = TRUE
+)
+# interact model: mood_class x gender
+fit_interact <- with(
+  stopvape.mice,
+  coxph(
+    Surv(Time.elapsed, status) ~
+      factor(mood_class) * gender_adj +
+      cluster(userid)
+  )
+)
+
+pooled_fit_interact <- pool(fit_interact)
+
+summary(
+  pooled_fit_interact,
+  conf.int   = TRUE,
+  exponentiate = TRUE
+)
+
+#AIC comparisons
+sapply(fit1$analyses, AIC)
+sapply(fit2$analyses, AIC)
+sapply(fit3$analyses, AIC)
+sapply(fitdemo$analyses, AIC)
+sapply(fit_interact$analyses, AIC)
+
+mean(sapply(fit1$analyses, AIC))
+mean(sapply(fit2$analyses, AIC))
+mean(sapply(fit3$analyses, AIC))
+mean(sapply(fitdemo$analyses, AIC))
+mean(sapply(fit_interact$analyses, AIC))
+
+#BIC
+sapply(fit1$analyses, BIC)
+sapply(fit2$analyses, BIC)
+sapply(fit3$analyses, BIC)
+sapply(fitdemo$analyses, BIC)
+sapply(fit_interact$analyses, BIC)
+
+mean(sapply(fit1$analyses, BIC))
+mean(sapply(fit2$analyses,BIC))
+mean(sapply(fit3$analyses,BIC))
+mean(sapply(fitdemo$analyses,BIC))
+mean(sapply(fit_interact$analyses,BIC))
+```
+# Gender-stratified analysis
+```{r gender stratified analysis}
+# Overall gender distribution
+table(stopvape$gender_adj)
+prop.table(table(stopvape$gender_adj)) * 100
+
+#men adjusted
+cox_mi_men <- with(
+  stopvape.mice,
+  coxph(
+    Surv(Time.elapsed, status) ~
+      factor(mood_class) +
+      age +
+      sexorient_adj +
+      race +
+      ecu11b_1 +
+      ecu16_1 +
+      ecu8_1 +
+      cur_csmk_1 +
+      cur_can_1 +
+      cur_alc_1 +
+      cur_otob_1 +
+      cluster(userid),
+    subset = (gender_adj == "Men")
+  )
+)
+pooled_men <- pool(cox_mi_men)
+
+# women adjusted
+cox_mi_women <- with(
+  stopvape.mice,
+  coxph(
+    Surv(Time.elapsed, status) ~
+      factor(mood_class) +
+      age +
+      sexorient_adj +
+      race +
+      ecu11b_1 +
+      ecu16_1 +
+      ecu8_1 +
+      cur_csmk_1 +
+      cur_can_1 +
+      cur_alc_1 +
+      cur_otob_1 +
+      cluster(userid),
+    subset = (gender_adj == "Women")
+  )
+)
+pooled_women <- pool(cox_mi_women)
+
+#others adjusted
+cox_mi_others <- with(
+  stopvape.mice,
+  coxph(
+    Surv(Time.elapsed, status) ~
+      factor(mood_class) +
+      age +
+      sexorient_adj +
+      race +
+      ecu11b_1 +
+      ecu16_1 +
+      ecu8_1 +
+      cur_csmk_1 +
+      cur_can_1 +
+      cur_alc_1 +
+      cur_otob_1 +
+      cluster(userid),
+    subset = (gender_adj == "Others")
+  )
+)
+pooled_others <- pool(cox_mi_others)
+
+summary(pooled_men,    conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_women,  conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_others, conf.int = TRUE, exponentiate = TRUE)
+
+```
+
+# KM survival curve by mood class
+
+```{r km curve}
+surv_elapsed <- Surv(time  = stopvape$Time.elapsed,
+                     event = stopvape$status
+                     )
+relapse.km <- npsurv(surv_elapsed ~ mood_class, data = stopvape)
+
+km_plot <- ggsurvplot(
+  relapse.km,
+  data = stopvape,
+  size = 1,
+  palette = c("#6A9EC2", "#E07B54", "#5BAD72"),  # 3 colours
+  pval= TRUE,
+  xlim = c(0, 20),
+  break.time.by = 10,
+  risk.tabe = TRUE,
+  risk.table.col = "strata",
+  legend.labs = c(
+    "Fair and Depressing",# Class 2
+    "Poor and Improving",# Class 1
+    "Good and Improving"# Class 3
+  ),
+  risk.table.height = 0.25,
+  ggtheme = theme_bw(),
+  title = "Kaplan-Meier Survival Curves by LCGA Mood Class", 
+  xlab = "Day of quit attempt (from first mood recording)", 
+  ylab = "Survival probability until vaping relapse"
+)
+# Time point: 7 days
+summary(relapse.km, times = 7)
+
+# 30 days
+summary(km_plot, times = 30)
+
+p <- arrange_ggsurvplots(list(km_plot), print = FALSE)
+
+ggsave("km_plot.png",
+       plot = p,
+       width = 10,
+       height = 6,
+       dpi = 300
+       )
+
+```
+
+# Log-rank test and median survival time
+```{r survival time}
+# Log-rank (Mantel-Haenszel) test
+sur.mh <- survdiff(surv_elapsed ~ mood_class, data = stopvape)
+sur.mh
+
+# Median survival time per mood class
+survfit(surv_elapsed ~ mood_class, data = stopvape)
+```
+# Sensitivity analysis: First quit challenge per participant
+```{r sensitivity analysis}
+stopvape_firstquit <- stopvape %>%
+  arrange(userid, challenge_id) %>%
+  distinct(userid, .keep_all = TRUE)
+
+cat("First-quit subset n:", nrow(stopvape_firstquit))
+cat(" Unique users:",n_distinct(stopvape_firstquit$userid))
+
+stopvape_firstquit$mood_class <- factor(
+  as.character(stopvape_firstquit$mood_class),
+  levels = c("Fair_Depressing", "Poor_Improving", "Good_Improving")
+)
+
+# MICE
+v <- c(
+  "userid", 
+  "age", 
+  "gender_adj",
+  "sexorient_adj",
+  "race",
+  "ecu11b_1", 
+  "ecu16_1", 
+  "ecu8_1",
+  "cur_csmk_1", 
+  "cur_can_1", 
+  "cur_alc_1", 
+  "cur_otob_1",
+  "status", 
+  "Time.elapsed", 
+  "mood_class"
+)
+stopvape_firstquit$userid <- as.factor(stopvape_firstquit$userid)
+
+stopvape_firstquit$userid <- as.factor(stopvape_firstquit$userid)
+
+set.seed(3098)
+stopvape_firstquit.mice <- mice(stopvape_firstquit[, v], m = 5, method = "cart")
+stopvape_firstquit.mice$method["userid"] <- ""
+stopvape_firstquit.mice$method
+plot(stopvape_firstquit.mice)
+densityplot(stopvape_firstquit.mice)
+densityplot(stopvape_firstquit.mice, ~ mood_class |.imp)
+```
+
+```{r first-quit cph}
+
+fit1_firstquit <- with(
+  stopvape_firstquit.mice,
+  coxph(Surv(Time.elapsed, status) ~ factor(mood_class) + cluster(userid))
+)
+
+fit2_firstquit <- with(
+  stopvape_firstquit.mice,
+  coxph(Surv(Time.elapsed, status) ~
+          factor(mood_class) +
+          ecu11b_1 + ecu16_1 + ecu8_1 +
+          cur_csmk_1 + cur_can_1 + cur_alc_1 + cur_otob_1 +
+          cluster(userid))
+)
+
+fit3_firstquit <- with(
+  stopvape_firstquit.mice,
+  coxph(Surv(Time.elapsed, status) ~
+          factor(mood_class) + age + gender_adj + sexorient_adj + race +
+          ecu11b_1 + ecu16_1 + ecu8_1 +
+          cur_csmk_1 + cur_can_1 + cur_alc_1 + cur_otob_1 +
+          cluster(userid))
+)
+
+fitdemo_firstquit <- with(
+  stopvape_firstquit.mice,
+  coxph(Surv(Time.elapsed, status) ~
+          factor(mood_class) + age + gender_adj + sexorient_adj + race +
+          cluster(userid))
+)
+
+
+pooled_fit1_firstquit<- pool(fit1_firstquit)
+pooled_fit2_firstquit<- pool(fit2_firstquit)
+pooled_fit3_firstquit<- pool(fit3_firstquit)
+pooled_fitdemo_firstquit <- pool(fitdemo_firstquit)
+
+summary(pooled_fit1_firstquit,    conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_fit2_firstquit,    conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_fit3_firstquit,    conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_fitdemo_firstquit, conf.int = TRUE, exponentiate = TRUE)
+```
+
+
